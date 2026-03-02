@@ -1,5 +1,12 @@
 /*
- * ai-bash: спрашиваю по-русски — получаю bash
+ * broai (ollama): спрашиваю по-русски — получаю bash
+ * Провайдер: Ollama (локально, бесплатно, без API-ключей)
+ * Модель: qwen2.5:7b
+ *
+ * Перед запуском:
+ *   ollama serve          # в отдельном терминале
+ *   ollama pull qwen2.5:7b
+ *
  * Компиляция: gcc -o broai broai.c -lcurl -ljson-c -lpthread
  */
 
@@ -8,20 +15,19 @@
 #include <string.h>
 #include <ctype.h>
 #include <sys/wait.h>
+#include <sys/utsname.h>
 #include <pthread.h>
 #include <unistd.h>
 #include <time.h>
 #include <curl/curl.h>
 #include <json-c/json.h>
 
-#define API_URL_ENV "AI_BASH_URL"
-#define API_KEY_ENV "OPENAI_API_KEY"
-#define MODEL_ENV   "AI_BASH_MODEL"
-#define PROVIDER_ENV "AI_PROVIDER"
+#define DEFAULT_URL   "http://localhost:11434/v1/chat/completions"
+#define DEFAULT_MODEL "qwen2.5:7b"
 
-#define DEFAULT_URL "https://api.openai.com/v1/chat/completions"
-#define DEFAULT_MODEL "gpt-4o-mini"
-#define DEFAULT_PROVIDER "openai"
+/* Переопределить через env при необходимости */
+#define API_URL_ENV  "AI_BASH_URL"
+#define MODEL_ENV    "AI_BASH_MODEL"
 
 #define MAX_INPUT_LEN 4096
 #define MAX_API_KEY_LEN 256
@@ -44,11 +50,29 @@ typedef struct {
     int count;
 } History;
 
-static const char *SYSTEM_PROMPT =
-    "You are a terminal assistant. The user describes a task in natural language. "
-    "Reply with ONLY a bash command — one line. "
-    "No explanations, no markdown, no backticks. "
-    "Multiple commands — use && or |. OS: Linux.";
+/* SYSTEM_PROMPT строится динамически при старте — добавляем OS и arch */
+static char SYSTEM_PROMPT[512];
+
+static void build_system_prompt(void) {
+    struct utsname u;
+    const char *os   = "Linux";
+    const char *arch = "x86_64";
+
+    if (uname(&u) == 0) {
+        os   = u.sysname;   /* "Linux" или "Darwin" */
+        arch = u.machine;   /* "x86_64", "arm64", "aarch64"… */
+    }
+
+    snprintf(SYSTEM_PROMPT, sizeof(SYSTEM_PROMPT),
+        "You are a terminal assistant. The user describes a task in natural language. "
+        "Reply with ONLY a bash command — one line, no explanation, no markdown, no backticks. "
+        "Multiple commands — use && or |. "
+        "OS: %s, arch: %s. "
+        "IMPORTANT: use only flags and options that exist on this OS and arch. "
+        "If unsure whether a flag exists, prefer the portable POSIX form or omit the flag. "
+        "Do NOT invent flags. Do NOT use Linux-only flags on macOS or vice versa.",
+        os, arch);
+}
 
 struct MemoryStruct {
     char *memory;
@@ -83,20 +107,10 @@ static char *get_env_or_default(const char *env_var, const char *default_val) {
     return (val != NULL && strlen(val) > 0) ? val : (char *)default_val;
 }
 
-/* Проверка API ключа на допустимые символы.
- * Разрешены: alphanum, -, _, . (OpenAI sk-proj-xxx.yyy), : (некоторые провайдеры) */
-static int validate_api_key(const char *key) {
-    if (key == NULL || strlen(key) == 0) return 0;
-    if (strlen(key) > MAX_API_KEY_LEN) return 0;
-    
-    for (size_t i = 0; i < strlen(key); i++) {
-        if (!isalnum(key[i]) && key[i] != '-' && key[i] != '_'
-                              && key[i] != '.' && key[i] != ':') {
-            return 0;
-        }
-    }
-    return 1;
-}
+/* Forward declaration */
+static char *escape_string(const char *str);
+static char *parse_openai_response(const char *json_str);
+static char *unescape_cmd(const char *str);
 
 /* Коды причин блокировки команды */
 typedef enum {
@@ -245,34 +259,7 @@ static void add_history_to_messages(struct json_object *messages,
     }
 }
 
-/* Формирование запроса для Anthropic API (/v1/messages) */
-static char *build_anthropic_request(const char *question, const char *model,
-                                     const History *h) {
-    struct json_object *root = json_object_new_object();
-    struct json_object *messages = json_object_new_array();
-
-    /* Anthropic: system — отдельное поле верхнего уровня */
-    json_object_object_add(root, "model", json_object_new_string(model));
-    json_object_object_add(root, "system", json_object_new_string(SYSTEM_PROMPT));
-    json_object_object_add(root, "max_tokens", json_object_new_int(1024));
-
-    /* Добавляем историю как контекст */
-    add_history_to_messages(messages, h, 0);
-
-    /* Текущий вопрос пользователя */
-    struct json_object *user_msg = json_object_new_object();
-    json_object_object_add(user_msg, "role", json_object_new_string("user"));
-    json_object_object_add(user_msg, "content", json_object_new_string(question));
-    json_object_array_add(messages, user_msg);
-
-    json_object_object_add(root, "messages", messages);
-
-    char *result = strdup(json_object_get_string(root));
-    json_object_put(root);
-    return result;
-}
-
-/* Формирование запроса для OpenAI-compatible API */
+/* Формирование запроса для Ollama (OpenAI-compatible API) */
 static char *build_openai_request(const char *question, const char *model,
                                   const History *h) {
     struct json_object *root = json_object_new_object();
@@ -298,46 +285,16 @@ static char *build_openai_request(const char *question, const char *model,
     json_object_object_add(root, "max_tokens", json_object_new_int(1024));
     json_object_object_add(root, "messages", messages);
 
-    /* Для Ollama/Qwen3: отключаем режим рассуждений (think=false).
-     * В режиме рассуждений модель возвращает пустой content и тратит
-     * токены на внутренние размышления вместо команды. */
-    char *provider = getenv("AI_PROVIDER");
-    if (provider != NULL &&
-        (strcmp(provider, "ollama") == 0 || strcmp(provider, "local") == 0)) {
-        json_object_object_add(root, "think", json_object_new_boolean(0));
-    }
+    /* Отключаем режим рассуждений Qwen3 (think=false) */
+    json_object_object_add(root, "think", json_object_new_boolean(0));
 
     char *result = strdup(json_object_get_string(root));
     json_object_put(root);
     return result;
 }
 
-/* Парсинг ответа Anthropic: content[0].text */
-static char *parse_anthropic_response(const char *json_str) {
-    struct json_object *response_json = json_tokener_parse(json_str);
-    if (response_json == NULL) return NULL;
-
-    char *cmd = NULL;
-    struct json_object *content;
-
-    /* Anthropic: {"content": [{"type": "text", "text": "..."}]} */
-    if (json_object_object_get_ex(response_json, "content", &content)) {
-        struct json_object *first_block = json_object_array_get_idx(content, 0);
-        if (first_block != NULL) {
-            struct json_object *text;
-            if (json_object_object_get_ex(first_block, "text", &text)) {
-                cmd = strdup(json_object_get_string(text));
-            }
-        }
-    }
-
-    json_object_put(response_json);
-    return cmd;
-}
-
-/* Парсинг ответа OpenAI: choices[0].message.content
- * Fallback на choices[0].message.reasoning — для Qwen3/Ollama reasoning моделей
- * которые возвращают пустой content и рассуждения в отдельном поле. */
+/* Парсинг ответа Ollama (OpenAI-compatible): choices[0].message.content
+ * Fallback на reasoning — Qwen3 иногда пишет ответ туда. */
 static char *parse_openai_response(const char *json_str) {
     struct json_object *response_json = json_tokener_parse(json_str);
     if (response_json == NULL) return NULL;
@@ -627,6 +584,34 @@ static char *strip_markdown(const char *str) {
     return strdup(p);
 }
 
+/* Убирает escape-последовательности которые LLM добавляет в команды:
+ *   \\  →  \      (двойной слеш → одинарный)
+ *   \"  →  "
+ *   \'  →  '
+ * Возвращает новую строку через malloc — вызывающий обязан освободить. */
+static char *unescape_cmd(const char *str) {
+    if (str == NULL) return NULL;
+
+    size_t len = strlen(str);
+    char *out = malloc(len + 1);
+    if (out == NULL) return NULL;
+
+    size_t i = 0, j = 0;
+    while (i < len) {
+        if (str[i] == '\\' && i + 1 < len) {
+            char next = str[i + 1];
+            if (next == '\\' || next == '"' || next == '\'') {
+                out[j++] = next;   /* заменяем \\ / \" / \' на сам символ */
+                i += 2;
+                continue;
+            }
+        }
+        out[j++] = str[i++];
+    }
+    out[j] = '\0';
+    return out;
+}
+
 /* Удаляет пробелы по краям строки.
  * Возвращает новую строку через malloc — вызывающий обязан освободить её.
  * (Старая версия возвращала указатель внутрь оригинальной строки,
@@ -768,13 +753,9 @@ static char *explain_command(const char *cmd) {
     if (chunk.memory == NULL) return NULL;
     chunk.size = 0;
 
-    char *api_key  = get_env_or_default(API_KEY_ENV, "");
-    char *api_url  = get_env_or_default(API_URL_ENV, DEFAULT_URL);
-    char *model    = get_env_or_default(MODEL_ENV, DEFAULT_MODEL);
-    char *provider = get_env_or_default(PROVIDER_ENV, DEFAULT_PROVIDER);
+    char *api_url = get_env_or_default(API_URL_ENV, DEFAULT_URL);
+    char *model   = get_env_or_default(MODEL_ENV, DEFAULT_MODEL);
 
-    /* Формируем запрос — всегда OpenAI-compatible формат для простоты,
-     * для Anthropic используем тот же build_anthropic_request с другим промптом */
     struct json_object *root = json_object_new_object();
     struct json_object *messages = json_object_new_array();
 
@@ -792,6 +773,7 @@ static char *explain_command(const char *cmd) {
     json_object_object_add(root, "temperature", json_object_new_int(0));
     json_object_object_add(root, "max_tokens", json_object_new_int(300));
     json_object_object_add(root, "messages", messages);
+    json_object_object_add(root, "think", json_object_new_boolean(0));
 
     char *post_data = strdup(json_object_get_string(root));
     json_object_put(root);
@@ -801,39 +783,15 @@ static char *explain_command(const char *cmd) {
 
     headers = curl_slist_append(headers, "Content-Type: application/json");
 
-    char auth_header[MAX_API_KEY_LEN + 32];
-    int is_anthropic = (strcmp(provider, "anthropic") == 0);
-    if (is_anthropic) {
-        snprintf(auth_header, sizeof(auth_header), "x-api-key: %s", api_key);
-        headers = curl_slist_append(headers, auth_header);
-        headers = curl_slist_append(headers, "anthropic-version: 2023-06-01");
-    } else if (strlen(api_key) > 0) {
-        snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s", api_key);
-        headers = curl_slist_append(headers, auth_header);
-    }
-
     curl_easy_setopt(curl, CURLOPT_URL, api_url);
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post_data);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&chunk);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "ai-bash/1.0");
-    /* Таймаут: BROAI_TIMEOUT env или 30с для cloud / 120с для local */
-    {
-        char *provider_env = getenv("AI_PROVIDER");
-        char *timeout_env  = getenv("BROAI_TIMEOUT");
-        long timeout = timeout_env ? atol(timeout_env) : 0L;
-        if (timeout <= 0) {
-            int is_local_provider = provider_env &&
-                                    (strcmp(provider_env, "ollama") == 0 ||
-                                     strcmp(provider_env, "local") == 0);
-            timeout = is_local_provider ? 120L : 30L;
-        }
-        curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout);
-    }
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "broai-ollama/1.0");
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 120L);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
 
-    /* Спиннер на время запроса */
     SpinnerState spinner_state;
     pthread_t spinner;
     spinner_start(&spinner_state, &spinner);
@@ -843,12 +801,8 @@ static char *explain_command(const char *cmd) {
     if (res == CURLE_OK) {
         long http_code = 0;
         curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-        if (http_code == 200) {
-            if (is_anthropic)
-                result = parse_anthropic_response(chunk.memory);
-            else
-                result = parse_openai_response(chunk.memory);
-        }
+        if (http_code == 200)
+            result = parse_openai_response(chunk.memory);
     }
 
     curl_slist_free_all(headers);
@@ -875,10 +829,8 @@ static char *info_command(const char *cmd, const char *original_question) {
     if (chunk.memory == NULL) return NULL;
     chunk.size = 0;
 
-    char *api_key  = get_env_or_default(API_KEY_ENV, "");
-    char *api_url  = get_env_or_default(API_URL_ENV, DEFAULT_URL);
-    char *model    = get_env_or_default(MODEL_ENV, DEFAULT_MODEL);
-    char *provider = get_env_or_default(PROVIDER_ENV, DEFAULT_PROVIDER);
+    char *api_url = get_env_or_default(API_URL_ENV, DEFAULT_URL);
+    char *model   = get_env_or_default(MODEL_ENV, DEFAULT_MODEL);
 
     struct json_object *root = json_object_new_object();
     struct json_object *messages = json_object_new_array();
@@ -906,6 +858,7 @@ static char *info_command(const char *cmd, const char *original_question) {
     json_object_object_add(root, "temperature", json_object_new_int(0));
     json_object_object_add(root, "max_tokens", json_object_new_int(600));
     json_object_object_add(root, "messages", messages);
+    json_object_object_add(root, "think", json_object_new_boolean(0));
 
     char *post_data = strdup(json_object_get_string(root));
     json_object_put(root);
@@ -915,35 +868,13 @@ static char *info_command(const char *cmd, const char *original_question) {
 
     headers = curl_slist_append(headers, "Content-Type: application/json");
 
-    char auth_header[MAX_API_KEY_LEN + 32];
-    int is_anthropic = (strcmp(provider, "anthropic") == 0);
-    if (is_anthropic) {
-        snprintf(auth_header, sizeof(auth_header), "x-api-key: %s", api_key);
-        headers = curl_slist_append(headers, auth_header);
-        headers = curl_slist_append(headers, "anthropic-version: 2023-06-01");
-    } else if (strlen(api_key) > 0) {
-        snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s", api_key);
-        headers = curl_slist_append(headers, auth_header);
-    }
-
     curl_easy_setopt(curl, CURLOPT_URL, api_url);
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post_data);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&chunk);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "ai-bash/1.0");
-    {
-        char *provider_env = getenv("AI_PROVIDER");
-        char *timeout_env  = getenv("BROAI_TIMEOUT");
-        long timeout = timeout_env ? atol(timeout_env) : 0L;
-        if (timeout <= 0) {
-            int is_local_provider = provider_env &&
-                                    (strcmp(provider_env, "ollama") == 0 ||
-                                     strcmp(provider_env, "local") == 0);
-            timeout = is_local_provider ? 120L : 30L;
-        }
-        curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout);
-    }
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "broai-ollama/1.0");
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 120L);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
 
     SpinnerState spinner_state;
@@ -955,12 +886,8 @@ static char *info_command(const char *cmd, const char *original_question) {
     if (res == CURLE_OK) {
         long http_code = 0;
         curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-        if (http_code == 200) {
-            if (is_anthropic)
-                result = parse_anthropic_response(chunk.memory);
-            else
-                result = parse_openai_response(chunk.memory);
-        }
+        if (http_code == 200)
+            result = parse_openai_response(chunk.memory);
     }
 
     curl_slist_free_all(headers);
@@ -1034,7 +961,6 @@ static char *ask(const char *question) {
     CURLcode res;
     struct curl_slist *headers = NULL;
     struct MemoryStruct chunk;
-    char *api_key, *api_url, *model;
     char *post_data;
     char *cmd = NULL;
 
@@ -1045,38 +971,12 @@ static char *ask(const char *question) {
     }
     chunk.size = 0;
 
-    api_key = get_env_or_default(API_KEY_ENV, "");
-    api_url = get_env_or_default(API_URL_ENV, DEFAULT_URL);
-    model = get_env_or_default(MODEL_ENV, DEFAULT_MODEL);
-    char *provider = get_env_or_default(PROVIDER_ENV, DEFAULT_PROVIDER);
-
-    int is_anthropic = (strcmp(provider, "anthropic") == 0);
-    /* Считаем локальным: явный провайдер ollama/local,
-     * или URL указывает на localhost / 127.0.0.1 (на случай если
-     * ~/.broai/config ещё не был sourced в текущей сессии) */
-    int is_local = (strcmp(provider, "ollama") == 0 ||
-                    strcmp(provider, "local") == 0  ||
-                    strstr(api_url, "localhost") != NULL ||
-                    strstr(api_url, "127.0.0.1") != NULL);
-
-    /* Валидация API ключа (пропускаем для локальных провайдеров) */
-    if (!is_local) {
-        if (!validate_api_key(api_key)) {
-            fprintf(stderr, "Error: invalid API key\n");
-            free(chunk.memory);
-            return NULL;
-        }
-    }
+    char *api_url = get_env_or_default(API_URL_ENV, DEFAULT_URL);
+    char *model   = get_env_or_default(MODEL_ENV, DEFAULT_MODEL);
 
     /* Загружаем историю предыдущих запросов */
     History history = load_history();
-
-    /* Формируем JSON-запрос в зависимости от провайдера */
-    if (is_anthropic) {
-        post_data = build_anthropic_request(question, model, &history);
-    } else {
-        post_data = build_openai_request(question, model, &history);
-    }
+    post_data = build_openai_request(question, model, &history);
 
     if (post_data == NULL) {
         fprintf(stderr, "Error: failed to build request\n");
@@ -1094,30 +994,13 @@ static char *ask(const char *question) {
 
     headers = curl_slist_append(headers, "Content-Type: application/json");
 
-    /* Заголовки авторизации в зависимости от провайдера */
-    char auth_header[MAX_API_KEY_LEN + 32];
-    if (is_anthropic) {
-        snprintf(auth_header, sizeof(auth_header), "x-api-key: %s", api_key);
-        headers = curl_slist_append(headers, auth_header);
-        headers = curl_slist_append(headers, "anthropic-version: 2023-06-01");
-    } else if (strlen(api_key) > 0) {
-        snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s", api_key);
-        headers = curl_slist_append(headers, auth_header);
-    }
-
     curl_easy_setopt(curl, CURLOPT_URL, api_url);
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post_data);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&chunk);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "ai-bash/1.0");
-    /* Таймаут: BROAI_TIMEOUT env или 30с cloud / 120с local */
-    {
-        char *timeout_env = getenv("BROAI_TIMEOUT");
-        long timeout = timeout_env ? atol(timeout_env) : 0L;
-        if (timeout <= 0) timeout = is_local ? 120L : 30L;
-        curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout);
-    }
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "broai-ollama/1.0");
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 120L);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
 
     /* Запускаем спиннер на время HTTP запроса */
@@ -1130,7 +1013,8 @@ static char *ask(const char *question) {
     spinner_stop(&spinner_state, &spinner);
 
     if (res != CURLE_OK) {
-        fprintf(stderr, "Error CURL: %s\n", curl_easy_strerror(res));
+        fprintf(stderr, "Error: cannot reach Ollama — %s\n", curl_easy_strerror(res));
+        fprintf(stderr, "Make sure Ollama is running: ollama serve\n");
         free(chunk.memory);
         curl_slist_free_all(headers);
         curl_easy_cleanup(curl);
@@ -1138,14 +1022,11 @@ static char *ask(const char *question) {
         return NULL;
     }
 
-    /* Проверка HTTP кода ответа */
     long http_code = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
     if (http_code != 200) {
-        fprintf(stderr, "Error API: HTTP %ld\n", http_code);
-        if (chunk.size > 0) {
-            fprintf(stderr, "Response: %s\n", chunk.memory);
-        }
+        fprintf(stderr, "Error: Ollama returned HTTP %ld\n", http_code);
+        if (chunk.size > 0) fprintf(stderr, "Response: %s\n", chunk.memory);
         free(chunk.memory);
         curl_slist_free_all(headers);
         curl_easy_cleanup(curl);
@@ -1153,18 +1034,9 @@ static char *ask(const char *question) {
         return NULL;
     }
 
-    /* Парсим ответ в зависимости от провайдера */
-    if (is_anthropic) {
-        cmd = parse_anthropic_response(chunk.memory);
-    } else {
-        cmd = parse_openai_response(chunk.memory);
-    }
+    cmd = parse_openai_response(chunk.memory);
+    if (cmd == NULL) fprintf(stderr, "Error: failed to parse response\n");
 
-    if (cmd == NULL) {
-        fprintf(stderr, "Error: failed to parse API response\n");
-    }
-
-    /* Логируем запрос и ответ для отладки */
     log_request(question, post_data, http_code, chunk.memory, cmd);
 
     curl_slist_free_all(headers);
@@ -1180,6 +1052,9 @@ int main(int argc, char *argv[]) {
     char *question;
     char *cmd;
     char input[16];  /* UTF-8: д/Д = 2 байта + \n + \0 — 16 байт достаточно */
+
+    /* Инициализируем system prompt с OS и архитектурой текущей системы */
+    build_system_prompt();
 
     if (argc < 2) {
         printf("Usage: bro [-e] [-i] \"find files larger than 100mb\"\n");
@@ -1263,6 +1138,18 @@ int main(int argc, char *argv[]) {
     char *trimmed = trim_whitespace(cmd);
     free(cmd);
     cmd = trimmed;
+
+    if (cmd == NULL) {
+        fprintf(stderr, "Error: failed to process API response\n");
+        free(original_question);
+        return 1;
+    }
+
+    /* Убираем экранирующие слеши которые LLM добавляет в вывод:
+     * \\ → \, \" → ", \' → ' */
+    char *unescaped = unescape_cmd(cmd);
+    free(cmd);
+    cmd = unescaped;
 
     if (cmd == NULL) {
         fprintf(stderr, "Error: failed to process API response\n");
